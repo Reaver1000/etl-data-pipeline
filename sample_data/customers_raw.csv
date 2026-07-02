@@ -1,0 +1,11 @@
+user_id,user_name,user_email,signup_country,marketing_opt_in
+1001,  Alice Johnson ,ALICE.J@EXAMPLE.COM,UK,yes
+1002,Bob Smith,bob.smith@example.com ,USA,no
+1003,Carol Danvers,carol.d@example.com,UK,yes
+1004,  Dan Brown,,Germany,no
+1005,Eve Adams , EVE.ADAMS@EXAMPLE.COM,France,yes
+1003,Carol Danvers,carol.d@example.com,UK,yes
+1006,Frank Castle,frank.c@example.com,USA,
+1007, Grace Hopper ,GRACE@EXAMPLE.COM,USA,yes
+1008,Heidi Lamarr,heidi.l@example.com,Austria,no
+1005,Eve Adams , EVE.ADAMS@EXAMPLE.COM,France,yes

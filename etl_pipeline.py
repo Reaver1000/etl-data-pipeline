@@ -1,36 +1,52 @@
 #!/usr/bin/env python3
-"""
-ETL Pipeline Framework
-Modular extraction, transformation, and loading framework.
+"""ETL Pipeline Framework.
+
+A small, composable extract-transform-load framework:
+
+- Extractors pull records from a source (CSV file, JSON API) into a common
+  list-of-dicts shape and never raise — failures are captured on the result.
+- Transformers reshape/clean the records (null handling, trimming, field
+  mapping) and report what they did.
+- Loaders persist the records; ``SQLiteLoader`` infers a table schema from
+  the data and writes with parameterised statements.
+- ``ETLPipeline`` chains any number of each and returns a run report.
+
+See ``demo.py`` for a runnable end-to-end example against the bundled
+sample data, and ``tests/`` for the behaviour spec.
 """
 
-import json
 import logging
+import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
 class ExtractionResult:
-    """Result of an extraction operation."""
+    """Outcome of one extractor run."""
+
     source: str
     data: List[Dict[str, Any]]
     metadata: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
-    extracted_at: datetime = field(default_factory=datetime.utcnow)
-    
+    extracted_at: datetime = field(default_factory=_utcnow)
+
     @property
     def success(self) -> bool:
-        return len(self.errors) == 0
-    
+        return not self.errors
+
     @property
     def record_count(self) -> int:
         return len(self.data)
@@ -38,328 +54,328 @@ class ExtractionResult:
 
 @dataclass
 class TransformResult:
-    """Result of a transformation operation."""
+    """Outcome of one transformer run."""
+
     data: List[Dict[str, Any]]
     schema: Dict[str, str] = field(default_factory=dict)
     validation_errors: List[Dict[str, Any]] = field(default_factory=list)
-    transformed_at: datetime = field(default_factory=datetime.utcnow)
-    
+    transformed_at: datetime = field(default_factory=_utcnow)
+
     @property
     def success(self) -> bool:
-        return len(self.validation_errors) == 0
+        return not self.validation_errors
 
 
 @dataclass
 class LoadResult:
-    """Result of a load operation."""
+    """Outcome of one loader run."""
+
     destination: str
     records_loaded: int
     errors: List[str] = field(default_factory=list)
-    loaded_at: datetime = field(default_factory=datetime.utcnow)
-    
+    loaded_at: datetime = field(default_factory=_utcnow)
+
     @property
     def success(self) -> bool:
-        return len(self.errors) == 0
+        return not self.errors
 
 
 class Extractor(ABC):
-    """Abstract base class for data extractors."""
-    
+    """Base class for data extractors."""
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.source_name = config.get('source_name', 'unknown')
-    
+        self.source_name = config.get("source_name", "unknown")
+
     @abstractmethod
     def extract(self) -> ExtractionResult:
-        """Extract data from source."""
-        pass
-    
-    def validate_config(self) -> bool:
-        """Validate extractor configuration."""
-        return True
+        """Extract data from the source. Must not raise — capture errors."""
 
 
 class APIExtractor(Extractor):
-    """Extract data from REST APIs."""
-    
+    """Extract records from a JSON REST endpoint.
+
+    Handles the three common response shapes: a bare list, an object with a
+    ``data``/``items`` list, or a single object.
+    """
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.base_url = config.get('base_url')
-        self.headers = config.get('headers', {})
-        self.auth = config.get('auth')
-    
+        self.base_url = config.get("base_url")
+        self.headers = config.get("headers", {})
+        self.auth = config.get("auth")
+
     def extract(self) -> ExtractionResult:
-        """Extract data from API endpoint."""
-        data = []
-        errors = []
-        
+        data: List[Dict[str, Any]] = []
+        errors: List[str] = []
         try:
             response = requests.get(
                 self.base_url,
                 headers=self.headers,
                 auth=self.auth,
-                timeout=self.config.get('timeout', 30)
+                timeout=self.config.get("timeout", 30),
             )
             response.raise_for_status()
-            
             result = response.json()
-            
-            # Handle paginated responses
             if isinstance(result, dict):
-                data = result.get('data', result.get('items', [result]))
+                data = result.get("data", result.get("items", [result]))
             elif isinstance(result, list):
                 data = result
             else:
                 data = [result]
-            
-            logger.info(f"Extracted {len(data)} records from {self.source_name}")
-            
+            logger.info("Extracted %d records from %s", len(data), self.source_name)
         except requests.RequestException as e:
-            errors.append(f"API request failed: {str(e)}")
-            logger.error(f"Extraction error for {self.source_name}: {e}")
-        
-        return ExtractionResult(
-            source=self.source_name,
-            data=data,
-            errors=errors
-        )
+            errors.append(f"API request failed: {e}")
+            logger.error("Extraction error for %s: %s", self.source_name, e)
+        return ExtractionResult(source=self.source_name, data=data, errors=errors)
 
 
 class CSVExtractor(Extractor):
-    """Extract data from CSV files."""
-    
+    """Extract records from a CSV file via pandas."""
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.file_path = config.get('file_path')
-    
+        self.file_path = config.get("file_path")
+
     def extract(self) -> ExtractionResult:
-        """Extract data from CSV file."""
         try:
             df = pd.read_csv(self.file_path)
-            data = df.to_dict('records')
-            logger.info(f"Extracted {len(data)} records from {self.file_path}")
-            
+            data = df.to_dict("records")
+            logger.info("Extracted %d records from %s", len(data), self.file_path)
             return ExtractionResult(
                 source=self.source_name,
                 data=data,
-                metadata={'columns': list(df.columns), 'shape': df.shape}
+                metadata={"columns": list(df.columns), "shape": df.shape},
             )
-        except Exception as e:
-            logger.error(f"CSV extraction error: {e}")
-            return ExtractionResult(
-                source=self.source_name,
-                data=[],
-                errors=[str(e)]
-            )
+        except (OSError, ValueError, pd.errors.ParserError) as e:
+            logger.error("CSV extraction error: %s", e)
+            return ExtractionResult(source=self.source_name, data=[], errors=[str(e)])
 
 
 class Transformer(ABC):
-    """Abstract base class for data transformers."""
-    
+    """Base class for data transformers."""
+
     @abstractmethod
     def transform(self, data: List[Dict[str, Any]]) -> TransformResult:
-        """Transform extracted data."""
-        pass
+        """Transform extracted records."""
 
 
 class DataCleaner(Transformer):
-    """Clean and standardize data."""
-    
+    """Standardise records: null handling, whitespace, casing.
+
+    Config keys:
+        null_handling: ``"drop"`` (default) drops rows with any null,
+                       ``"fill"`` replaces nulls with ``fill_value``.
+        trim_strings:  strip leading/trailing whitespace on string columns.
+        lowercase_fields: list of columns to force to lowercase.
+    """
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.null_handling = config.get('null_handling', 'drop')
-        self.trim_strings = config.get('trim_strings', True)
-        self.lowercase_fields = config.get('lowercase_fields', [])
-    
+        self.null_handling = config.get("null_handling", "drop")
+        self.trim_strings = config.get("trim_strings", True)
+        self.lowercase_fields = config.get("lowercase_fields", [])
+
     def transform(self, data: List[Dict[str, Any]]) -> TransformResult:
-        """Clean data according to configuration."""
+        if not data:
+            return TransformResult(data=[])
+
         df = pd.DataFrame(data)
-        validation_errors = []
-        
-        # Handle nulls
-        if self.null_handling == 'drop':
+
+        if self.null_handling == "drop":
             df = df.dropna()
-        elif self.null_handling == 'fill':
-            df = df.fillna(self.config.get('fill_value', ''))
-        
-        # Trim strings
+        elif self.null_handling == "fill":
+            df = df.fillna(self.config.get("fill_value", ""))
+
         if self.trim_strings:
-            string_cols = df.select_dtypes(include=['object']).columns
-            df[string_cols] = df[string_cols].apply(lambda x: x.str.strip())
-        
-        # Lowercase specified fields
-        for field in self.lowercase_fields:
-            if field in df.columns:
-                df[field] = df[field].str.lower()
-        
-        # Detect schema
+            # The map guards with isinstance, so this is safe on every column
+            # (and avoids select_dtypes' object/str dtype split across pandas 2/3).
+            for col in df.columns:
+                df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else v)
+
+        for col in self.lowercase_fields:
+            if col in df.columns:
+                df[col] = df[col].map(lambda v: v.lower() if isinstance(v, str) else v)
+
         schema = {col: str(dtype) for col, dtype in df.dtypes.items()}
-        
-        return TransformResult(
-            data=df.to_dict('records'),
-            schema=schema,
-            validation_errors=validation_errors
-        )
+        return TransformResult(data=df.to_dict("records"), schema=schema)
 
 
 class FieldMapper(Transformer):
-    """Map fields between different schemas."""
-    
+    """Rename fields between schemas; unmapped fields are dropped.
+
+    Dropping unmapped fields is deliberate — the mapper doubles as a
+    column whitelist so unexpected upstream fields never reach the loader.
+    """
+
     def __init__(self, mapping: Dict[str, str]):
         self.mapping = mapping
-    
+
     def transform(self, data: List[Dict[str, Any]]) -> TransformResult:
-        """Apply field mapping."""
-        transformed = []
-        
-        for record in data:
-            new_record = {}
-            for old_field, new_field in self.mapping.items():
-                if old_field in record:
-                    new_record[new_field] = record[old_field]
-            transformed.append(new_record)
-        
+        transformed = [
+            {new: record[old] for old, new in self.mapping.items() if old in record}
+            for record in data
+        ]
         return TransformResult(data=transformed)
 
 
+class Deduplicator(Transformer):
+    """Drop records that duplicate an earlier record on the key fields."""
+
+    def __init__(self, key_fields: List[str]):
+        self.key_fields = key_fields
+
+    def transform(self, data: List[Dict[str, Any]]) -> TransformResult:
+        seen = set()
+        unique = []
+        for record in data:
+            key = tuple(record.get(k) for k in self.key_fields)
+            if key not in seen:
+                seen.add(key)
+                unique.append(record)
+        return TransformResult(data=unique)
+
+
 class Loader(ABC):
-    """Abstract base class for data loaders."""
-    
+    """Base class for data loaders."""
+
     @abstractmethod
     def load(self, data: List[Dict[str, Any]]) -> LoadResult:
-        """Load data to destination."""
-        pass
+        """Persist records to the destination."""
 
 
-class DatabaseLoader(Loader):
-    """Load data to SQL database."""
-    
-    def __init__(self, connection_string: str, table_name: str):
-        self.connection_string = connection_string
+_SQLITE_TYPES = {"int": "INTEGER", "float": "REAL", "bool": "INTEGER"}
+
+
+class SQLiteLoader(Loader):
+    """Load records into a SQLite table.
+
+    The table is created if missing, with column types inferred from the
+    first record (int/float map to INTEGER/REAL, everything else TEXT).
+    Inserts are parameterised; the table name is validated because DDL
+    cannot be parameterised.
+    """
+
+    def __init__(self, db_path: str, table_name: str, if_exists: str = "append"):
+        if not table_name.replace("_", "").isalnum():
+            raise ValueError(f"Invalid table name: {table_name!r}")
+        if if_exists not in ("append", "replace"):
+            raise ValueError("if_exists must be 'append' or 'replace'")
+        self.db_path = db_path
         self.table_name = table_name
-    
+        self.if_exists = if_exists
+
+    @staticmethod
+    def _column_type(value: Any) -> str:
+        for prefix, sql_type in _SQLITE_TYPES.items():
+            if type(value).__name__.startswith(prefix):
+                return sql_type
+        return "TEXT"
+
     def load(self, data: List[Dict[str, Any]]) -> LoadResult:
-        """Load data to database table."""
+        if not data:
+            return LoadResult(destination=self.table_name, records_loaded=0)
         try:
-            df = pd.DataFrame(data)
-            # In production, use SQLAlchemy or similar
-            # df.to_sql(self.table_name, self.connection_string, if_exists='append', index=False)
-            
-            logger.info(f"Would load {len(df)} records to {self.table_name}")
-            
-            return LoadResult(
-                destination=self.table_name,
-                records_loaded=len(df)
-            )
-        except Exception as e:
-            logger.error(f"Load error: {e}")
-            return LoadResult(
-                destination=self.table_name,
-                records_loaded=0,
-                errors=[str(e)]
-            )
+            columns = list(data[0].keys())
+            col_defs = ", ".join(f'"{c}" {self._column_type(data[0][c])}' for c in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            quoted_cols = ", ".join(f'"{c}"' for c in columns)
+
+            with sqlite3.connect(self.db_path) as conn:
+                if self.if_exists == "replace":
+                    conn.execute(f'DROP TABLE IF EXISTS "{self.table_name}"')
+                conn.execute(f'CREATE TABLE IF NOT EXISTS "{self.table_name}" ({col_defs})')
+                conn.executemany(
+                    f'INSERT INTO "{self.table_name}" ({quoted_cols}) VALUES ({placeholders})',
+                    [tuple(record.get(c) for c in columns) for record in data],
+                )
+            logger.info("Loaded %d records into %s.%s", len(data), self.db_path, self.table_name)
+            return LoadResult(destination=self.table_name, records_loaded=len(data))
+        except sqlite3.Error as e:
+            logger.error("Load error: %s", e)
+            return LoadResult(destination=self.table_name, records_loaded=0, errors=[str(e)])
+
+
+class CSVLoader(Loader):
+    """Write records to a CSV file."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def load(self, data: List[Dict[str, Any]]) -> LoadResult:
+        if not data:
+            return LoadResult(destination=self.file_path, records_loaded=0)
+        try:
+            pd.DataFrame(data).to_csv(self.file_path, index=False)
+            logger.info("Wrote %d records to %s", len(data), self.file_path)
+            return LoadResult(destination=self.file_path, records_loaded=len(data))
+        except OSError as e:
+            return LoadResult(destination=self.file_path, records_loaded=0, errors=[str(e)])
 
 
 class ETLPipeline:
-    """Main ETL pipeline orchestrator."""
-    
+    """Chain extractors, transformers, and a loader; report on the run."""
+
     def __init__(self, name: str):
         self.name = name
         self.extractors: List[Extractor] = []
         self.transformers: List[Transformer] = []
         self.loader: Optional[Loader] = None
-    
-    def add_extractor(self, extractor: Extractor) -> 'ETLPipeline':
-        """Add an extractor to the pipeline."""
+
+    def add_extractor(self, extractor: Extractor) -> "ETLPipeline":
         self.extractors.append(extractor)
         return self
-    
-    def add_transformer(self, transformer: Transformer) -> 'ETLPipeline':
-        """Add a transformer to the pipeline."""
+
+    def add_transformer(self, transformer: Transformer) -> "ETLPipeline":
         self.transformers.append(transformer)
         return self
-    
-    def set_loader(self, loader: Loader) -> 'ETLPipeline':
-        """Set the loader for the pipeline."""
+
+    def set_loader(self, loader: Loader) -> "ETLPipeline":
         self.loader = loader
         return self
-    
+
     def run(self) -> Dict[str, Any]:
-        """Execute the ETL pipeline."""
-        logger.info(f"Starting ETL pipeline: {self.name}")
-        start_time = datetime.utcnow()
-        
-        results = {
-            'pipeline_name': self.name,
-            'started_at': start_time.isoformat(),
-            'extractions': [],
-            'transformations': [],
-            'load': None
+        """Execute extract → transform → load and return a run report."""
+        logger.info("Starting ETL pipeline: %s", self.name)
+        start_time = _utcnow()
+        report: Dict[str, Any] = {
+            "pipeline_name": self.name,
+            "started_at": start_time.isoformat(),
+            "extractions": [],
+            "transformations": [],
+            "load": None,
         }
-        
-        # Extract phase
-        all_data = []
+
+        all_data: List[Dict[str, Any]] = []
         for extractor in self.extractors:
-            extraction_result = extractor.extract()
-            results['extractions'].append({
-                'source': extraction_result.source,
-                'records': extraction_result.record_count,
-                'success': extraction_result.success
-            })
-            all_data.extend(extraction_result.data)
-        
-        # Transform phase
-        transformed_data = all_data
+            result = extractor.extract()
+            report["extractions"].append(
+                {"source": result.source, "records": result.record_count,
+                 "success": result.success, "errors": result.errors}
+            )
+            all_data.extend(result.data)
+
+        data = all_data
         for transformer in self.transformers:
-            transform_result = transformer.transform(transformed_data)
-            results['transformations'].append({
-                'records_in': len(transformed_data),
-                'records_out': len(transform_result.data),
-                'success': transform_result.success
-            })
-            transformed_data = transform_result.data
-        
-        # Load phase
+            result = transformer.transform(data)
+            report["transformations"].append(
+                {"transformer": type(transformer).__name__,
+                 "records_in": len(data), "records_out": len(result.data),
+                 "success": result.success}
+            )
+            data = result.data
+
         if self.loader:
-            load_result = self.loader.load(transformed_data)
-            results['load'] = {
-                'destination': load_result.destination,
-                'records_loaded': load_result.records_loaded,
-                'success': load_result.success
+            load_result = self.loader.load(data)
+            report["load"] = {
+                "destination": load_result.destination,
+                "records_loaded": load_result.records_loaded,
+                "success": load_result.success,
+                "errors": load_result.errors,
             }
-        
-        end_time = datetime.utcnow()
-        results['completed_at'] = end_time.isoformat()
-        results['duration_seconds'] = (end_time - start_time).total_seconds()
-        
-        logger.info(f"Pipeline completed: {self.name} in {results['duration_seconds']:.2f}s")
-        
-        return results
 
-
-if __name__ == '__main__':
-    # Example usage
-    pipeline = ETLPipeline('user_sync')
-    
-    # Add extractors
-    pipeline.add_extractor(APIExtractor({
-        'source_name': 'users_api',
-        'base_url': 'https://api.example.com/users',
-        'headers': {'Authorization': 'Bearer token'}
-    }))
-    
-    # Add transformers
-    pipeline.add_transformer(DataCleaner({
-        'null_handling': 'drop',
-        'trim_strings': True
-    }))
-    
-    pipeline.add_transformer(FieldMapper({
-        'user_id': 'id',
-        'user_name': 'name',
-        'user_email': 'email'
-    }))
-    
-    # Run pipeline
-    result = pipeline.run()
-    print(json.dumps(result, indent=2))
+        end_time = _utcnow()
+        report["completed_at"] = end_time.isoformat()
+        report["duration_seconds"] = (end_time - start_time).total_seconds()
+        logger.info("Pipeline completed: %s in %.2fs", self.name, report["duration_seconds"])
+        return report
