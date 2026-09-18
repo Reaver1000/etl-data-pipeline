@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Reaver1000/etl-data-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Reaver1000/etl-data-pipeline/actions/workflows/ci.yml)
 
-A small, composable extract-transform-load framework in Python, with a runnable end-to-end demo and a full test suite. Built to show the shape of a real pipeline — pluggable stages, error capture instead of crashes, and a run report — at a size you can read in one sitting.
+A small, composable extract-transform-load framework in Python, with a runnable end-to-end demo and a full test suite. It demonstrates pluggable stages, explicit error capture, schema mapping, deduplication, SQLite loading, and structured run reports.
 
 ```
 CSV / JSON API          clean → map → dedupe            SQLite / CSV
